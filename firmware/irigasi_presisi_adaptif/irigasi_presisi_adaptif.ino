@@ -14,13 +14,15 @@
 #include <LiquidCrystal_I2C.h>
 #include <math.h>
 
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR < 3)
-  #error "Kode ini menggunakan API PWM ESP32 Arduino Core 3.x (ledcAttach/ledcWrite). Perbarui board package esp32 ke versi 3.x."
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
+  #define ESP32_CORE_V3 1
+#else
+  #define ESP32_CORE_V3 0
 #endif
 
 // ============================================================================
-// 1. KONFIGURASI PIN (SESUAI PEMETAAN PERANGKAT KERAS - JANGAN UBAH)
-//    Catatan: Tidak ada LED indikator. GPIO13, GPIO14, GPIO32 tidak digunakan.
+// 1. KONFIGURASI PIN (SESUAI PEMETAAN PERANGKAT KERAS)
+//    Catatan: Tidak ada LED indikator. GPIO13, GPIO14, GPIO33 tidak digunakan.
 // ============================================================================
 constexpr uint8_t PIN_SOIL_1     = 34;  // Sensor kelembapan tanah 1 (AO, 3.3V)
 constexpr uint8_t PIN_SOIL_2     = 35;  // Sensor kelembapan tanah 2 (AO, 3.3V)
@@ -30,8 +32,8 @@ constexpr uint8_t PIN_LCD_SCL    = 22;  // LCD 16x2 I2C (via BSS138)
 constexpr uint8_t PIN_ENC_CLK    = 18;  // Rotary encoder KY-040 CLK (3.3V)
 constexpr uint8_t PIN_ENC_DT     = 19;  // Rotary encoder KY-040 DT  (3.3V)
 constexpr uint8_t PIN_ENC_SW     = 23;  // Rotary encoder KY-040 SW  (3.3V)
-constexpr uint8_t PIN_POMPA_PWM  = 25;  // Modul MOSFET TRIG/PWM pompa 12V
-constexpr uint8_t PIN_BUZZER     = 33;  // Basis NPN (via R 1k) -> Buzzer 5V
+constexpr uint8_t PIN_POMPA_PWM  = 14;  // Modul MOSFET TRIG/PWM pompa 12V
+constexpr uint8_t PIN_BUZZER     = 32;  // Basis NPN (via R 1k) -> Buzzer 5V
 
 // ============================================================================
 // 2. KONFIGURASI PERANGKAT KERAS, KALIBRASI, PWM, & PROTEKSI
@@ -50,9 +52,10 @@ constexpr uint32_t INTERVAL_HALAMAN_LCD_MS = 2500; // Pergantian halaman LCD
 constexpr bool POMPA_AKTIF_HIGH           = true;  // false jika modul aktif-LOW
 constexpr bool BUZZER_AKTIF_HIGH          = true;  // NPN low-side: HIGH = ON
 
-// --- Pengaturan PWM Pompa (ESP32 Arduino Core 3.x) ---
+// --- Pengaturan PWM Pompa (Kompatibel ESP32 Arduino Core 3.x & 2.x) ---
 constexpr uint32_t PWM_FREQ_HZ            = 1000;  // Frekuensi PWM (Hz)
 constexpr uint8_t  PWM_RES_BITS           = 8;     // Resolusi 8-bit (0..255)
+constexpr uint8_t  PWM_CHANNEL_V2         = 0;     // Channel LEDC (khusus Core 2.x)
 constexpr uint32_t PWM_MAX_RAW            = (1UL << PWM_RES_BITS) - 1UL;
 // Duty cycle minimum agar pompa mulai berputar & tetap mengalir WAJIB diuji
 // pada pompa fisik. Duty cycle PWM TIDAK berbanding lurus dengan debit air.
@@ -183,6 +186,7 @@ uint8_t  alarmLangkah          = 0;
 uint32_t alarmWaktuLangkahMs   = 0;
 
 // --- LCD & Serial ---
+bool     lcdTerdeteksi         = false;
 uint8_t  halamanLcd            = 0;
 uint32_t waktuGantiHalamanMs   = 0;
 uint32_t waktuCetakSerialMs    = 0;
@@ -225,13 +229,26 @@ const char* teksGangguanLcd(JenisGangguan g) {
 // ============================================================================
 // 7. FUNGSI KENDALI POMPA & BUZZER (SAFETY-FIRST)
 // ============================================================================
+void inisialisasiPwmPompa() {
+#if ESP32_CORE_V3
+  ledcAttach(PIN_POMPA_PWM, PWM_FREQ_HZ, PWM_RES_BITS);
+#else
+  ledcSetup(PWM_CHANNEL_V2, PWM_FREQ_HZ, PWM_RES_BITS);
+  ledcAttachPin(PIN_POMPA_PWM, PWM_CHANNEL_V2);
+#endif
+}
+
 void tulisPwmPompa(float dutyPct) {
   float dutyTerbatas = constrain(dutyPct, 0.0f, 100.0f);
   uint32_t nilaiPwm = (uint32_t)lroundf((dutyTerbatas / 100.0f) * (float)PWM_MAX_RAW);
   if (!POMPA_AKTIF_HIGH) {
     nilaiPwm = PWM_MAX_RAW - nilaiPwm;
   }
+#if ESP32_CORE_V3
   ledcWrite(PIN_POMPA_PWM, nilaiPwm);
+#else
+  ledcWrite(PWM_CHANNEL_V2, nilaiPwm);
+#endif
 }
 
 void setPompaOff() {
@@ -634,6 +651,9 @@ void perbaruiAlarmBuzzer(uint32_t now) {
 // 14. TAMPILAN LCD 16x2 TANPA KEDIPAN
 // ============================================================================
 void tulisBarisLcd(uint8_t baris, const char* teks) {
+  if (!lcdTerdeteksi) {
+    return;
+  }
   char buf[LCD_KOLOM + 1];
   uint8_t len = 0;
   while (teks[len] != '\0' && len < LCD_KOLOM) {
@@ -738,7 +758,7 @@ void setup() {
   // 1) Pastikan pompa dan buzzer MATI sejak instruksi paling awal
   digitalWrite(PIN_POMPA_PWM, POMPA_AKTIF_HIGH ? LOW : HIGH);
   pinMode(PIN_POMPA_PWM, OUTPUT);
-  ledcAttach(PIN_POMPA_PWM, PWM_FREQ_HZ, PWM_RES_BITS);
+  inisialisasiPwmPompa();
   setPompaOff();
 
   digitalWrite(PIN_BUZZER, BUZZER_AKTIF_HIGH ? LOW : HIGH);
@@ -763,12 +783,22 @@ void setup() {
   pinMode(PIN_FLOW, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(PIN_FLOW), isrFlowPulse, FALLING);
 
-  // 6) Inisialisasi LCD 16x2 I2C
+  // 6) Cek & inisialisasi LCD 16x2 I2C (non-blocking jika LCD belum terhubung)
   Wire.begin(PIN_LCD_SDA, PIN_LCD_SCL);
   Wire.setTimeOut(20);
-  lcd.init();
-  lcd.backlight();
-  lcd.clear();
+  Wire.beginTransmission(LCD_I2C_ADDR);
+  uint8_t i2cErr = Wire.endTransmission();
+  if (i2cErr == 0) {
+    lcdTerdeteksi = true;
+    lcd.init();
+    lcd.backlight();
+    lcd.clear();
+    Serial.printf("[LCD] Terdeteksi di 0x%02X.\n", LCD_I2C_ADDR);
+  } else {
+    lcdTerdeteksi = false;
+    Serial.printf("[LCD] Tidak merespons di 0x%02X (err=%u); cek kabel SDA/SCL/BSS138/alamat. Lanjut tanpa LCD.\n",
+                  LCD_I2C_ADDR, i2cErr);
+  }
 
   // 7) Pembacaan awal sensor & masuk ke menu pemilihan profil (pompa tetap OFF)
   uint32_t now = millis();
